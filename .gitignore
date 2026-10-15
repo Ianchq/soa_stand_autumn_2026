@@ -3,3 +3,4 @@ results/
 .mocks-token
 /mocks/mocks
 /runner/runner
+.DS_Store

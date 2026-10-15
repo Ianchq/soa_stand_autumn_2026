@@ -1,11 +1,11 @@
-FROM golang:1.26-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY *.go ./
-RUN CGO_ENABLED=0 go build -trimpath -o /out/orders .
+FROM gradle:8.11-jdk21 AS build
+WORKDIR /app
+COPY settings.gradle.kts build.gradle.kts ./
+COPY src ./src
+RUN gradle buildFatJar --no-daemon
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/orders /orders
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/build/libs/*-all.jar app.jar
 EXPOSE 8080
-ENTRYPOINT ["/orders"]
+CMD ["java", "-jar", "app.jar"]

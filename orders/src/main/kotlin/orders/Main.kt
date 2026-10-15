@@ -17,6 +17,7 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respondText
+import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
@@ -70,6 +71,13 @@ CREATE TABLE IF NOT EXISTS orders (
 )"""
 
 private val MIGRATIONS = listOf(
+    "CREATE TABLE IF NOT EXISTS event_outbox (id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE, " +
+        "occurred_at TEXT NOT NULL, attempts INT NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS event_outbox_due_idx ON event_outbox (next_attempt_at)",
+    "CREATE TABLE IF NOT EXISTS delivery_events (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, " +
+        "bonus_points BIGINT NOT NULL CHECK (bonus_points > 0), processed_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE TABLE IF NOT EXISTS bonus_balances (user_id TEXT PRIMARY KEY, " +
+        "points BIGINT NOT NULL DEFAULT 0 CHECK (points >= 0))",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()",
     "CREATE INDEX IF NOT EXISTS orders_pending_idx ON orders (next_attempt_at) WHERE status = 'pending'",
@@ -88,6 +96,16 @@ data class OrderRequest(
     val items: List<Item>,
 )
 
+@Serializable
+data class DeliveryEvent(
+    val id: String,
+    val type: String,
+    @SerialName("user_id") val userId: String,
+    @SerialName("bonus_points") val bonusPoints: Long,
+)
+
+class PendingEvent(val id: String, val orderId: String, val occurredAt: String, val attempts: Int)
+
 class PendingOrder(
     val id: String,
     val amount: Long,
@@ -102,6 +120,7 @@ class App(
     private val client: HttpClient,
     private val paymentUrl: String,
     private val inventoryUrl: String,
+    private val eventsUrl: String,
 ) {
     private val paymentBreaker = CircuitBreaker("payment")
 
@@ -166,6 +185,64 @@ class App(
                 put("amount_cents", row.second)
             })
         }
+    }
+
+    suspend fun deliveryWebhook(call: ApplicationCall) {
+        val event = try {
+            json.decodeFromString<DeliveryEvent>(call.receiveText())
+        } catch (_: Exception) {
+            null
+        }
+        if (event == null || event.id.isBlank() || event.type != "delivery.confirmed" ||
+            event.userId.isBlank() || event.bonusPoints <= 0
+        ) {
+            call.respondJson(HttpStatusCode.BadRequest, buildJsonObject { put("error", "bad_request") })
+            return
+        }
+        withContext(Dispatchers.IO) {
+            ds.connection.use { c ->
+                c.autoCommit = false
+                try {
+                    val inserted = c.prepareStatement(
+                        "INSERT INTO delivery_events (id, user_id, bonus_points) VALUES (?, ?, ?) " +
+                            "ON CONFLICT (id) DO NOTHING"
+                    ).use { st ->
+                        st.setString(1, event.id)
+                        st.setString(2, event.userId)
+                        st.setLong(3, event.bonusPoints)
+                        st.executeUpdate()
+                    }
+                    if (inserted == 1) {
+                        c.prepareStatement(
+                            "INSERT INTO bonus_balances (user_id, points) VALUES (?, ?) " +
+                                "ON CONFLICT (user_id) DO UPDATE SET points = bonus_balances.points + EXCLUDED.points"
+                        ).use { st ->
+                            st.setString(1, event.userId)
+                            st.setLong(2, event.bonusPoints)
+                            st.executeUpdate()
+                        }
+                    }
+                    c.commit()
+                } catch (e: Exception) {
+                    c.rollback()
+                    throw e
+                }
+            }
+        }
+        call.respond(HttpStatusCode.OK)
+    }
+
+    suspend fun getBonus(call: ApplicationCall) {
+        val id = call.parameters["id"] ?: ""
+        val points = withContext(Dispatchers.IO) {
+            ds.connection.use { c ->
+                c.prepareStatement("SELECT points FROM bonus_balances WHERE user_id = ?").use { st ->
+                    st.setString(1, id)
+                    st.executeQuery().use { rs -> if (rs.next()) rs.getLong(1) else 0L }
+                }
+            }
+        }
+        call.respondJson(HttpStatusCode.OK, buildJsonObject { put("points", points) })
     }
 
     // ---------- Бизнес-логика ----------
@@ -275,6 +352,59 @@ class App(
         }
     }
 
+    fun startOutboxWorker(scope: CoroutineScope) = scope.launch {
+        if (eventsUrl.isBlank()) {
+            log.info("шина событий не настроена; публикация outbox отключена")
+            return@launch
+        }
+        while (isActive) {
+            val batch = try {
+                claimEvents(WORKER_BATCH)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.warn("outbox: не удалось взять события: {}", e.toString())
+                emptyList()
+            }
+            if (batch.isEmpty()) {
+                delay(300)
+                continue
+            }
+            batch.forEach { event ->
+                try {
+                    val code = status(
+                        HttpMethod.Post,
+                        "$eventsUrl/events",
+                        buildJsonObject {
+                            put("id", event.id)
+                            put("type", "order.paid")
+                            put("order_id", event.orderId)
+                            put("occurred_at", event.occurredAt)
+                        },
+                    )
+                    if (code == 202) {
+                        deleteEvent(event.id)
+                    } else {
+                        deferEventSafely(event)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    log.warn("outbox: публикация события {} не удалась: {}", event.id, e.toString())
+                    deferEventSafely(event)
+                }
+            }
+        }
+    }
+
+    private suspend fun deferEventSafely(event: PendingEvent) {
+        try {
+            retryEvent(event.id, event.attempts + 1)
+        } catch (e: Exception) {
+            log.warn("outbox: не удалось отложить событие {}: {}", event.id, e.toString())
+        }
+    }
+
     private suspend fun processPending(o: PendingOrder) {
         try {
             val status = tryComplete(o.id, o.amount, o.items)
@@ -317,13 +447,70 @@ class App(
     private suspend fun updateStatus(id: String, status: String) =
         withContext(Dispatchers.IO) {
             ds.connection.use { c ->
-                c.prepareStatement("UPDATE orders SET status = ? WHERE id = ? AND status = 'pending'").use { st ->
-                    st.setString(1, status)
-                    st.setString(2, id)
-                    st.executeUpdate()
+                c.autoCommit = false
+                try {
+                    val changed = c.prepareStatement(
+                        "UPDATE orders SET status = ? WHERE id = ? AND status = 'pending'"
+                    ).use { st ->
+                        st.setString(1, status)
+                        st.setString(2, id)
+                        st.executeUpdate()
+                    }
+                    if (changed == 1 && status == "paid") {
+                        c.prepareStatement(
+                            "INSERT INTO event_outbox (id, order_id, occurred_at) VALUES (?, ?, ?) " +
+                                "ON CONFLICT (order_id) DO NOTHING"
+                        ).use { st ->
+                            st.setString(1, UUID.randomUUID().toString())
+                            st.setString(2, id)
+                            st.setString(3, java.time.Instant.now().toString())
+                            st.executeUpdate()
+                        }
+                    }
+                    c.commit()
+                } catch (e: Exception) {
+                    c.rollback()
+                    throw e
                 }
             }
         }
+
+    private suspend fun claimEvents(limit: Int): List<PendingEvent> = withContext(Dispatchers.IO) {
+        ds.connection.use { c ->
+            c.prepareStatement(
+                "UPDATE event_outbox SET next_attempt_at = now() + interval '10 seconds' " +
+                    "WHERE id IN (SELECT id FROM event_outbox WHERE next_attempt_at <= now() " +
+                    "ORDER BY next_attempt_at LIMIT ? FOR UPDATE SKIP LOCKED) " +
+                    "RETURNING id, order_id, occurred_at, attempts"
+            ).use { st ->
+                st.setInt(1, limit)
+                st.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) add(PendingEvent(rs.getString(1), rs.getString(2), rs.getString(3), rs.getInt(4)))
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun deleteEvent(id: String) = withContext(Dispatchers.IO) {
+        ds.connection.use { c -> c.prepareStatement("DELETE FROM event_outbox WHERE id = ?").use { st ->
+            st.setString(1, id); st.executeUpdate()
+        } }
+    }
+
+    private suspend fun retryEvent(id: String, attempts: Int) = withContext(Dispatchers.IO) {
+        ds.connection.use { c ->
+            c.prepareStatement(
+                "UPDATE event_outbox SET attempts = ?, next_attempt_at = now() + make_interval(secs => ?) WHERE id = ?"
+            ).use { st ->
+                st.setInt(1, attempts)
+                st.setDouble(2, backoffMs(attempts) / 1000.0)
+                st.setString(3, id)
+                st.executeUpdate()
+            }
+        }
+    }
 
     private suspend fun scheduleRetry(id: String, attempts: Int) =
         withContext(Dispatchers.IO) {
@@ -465,9 +652,11 @@ fun main() {
         client = client,
         paymentUrl = env("PAYMENT_URL").trimEnd('/'),
         inventoryUrl = env("INVENTORY_URL").trimEnd('/'),
+        eventsUrl = System.getenv("EVENTS_URL")?.trimEnd('/') ?: "",
     )
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     app.startWorker(scope)
+    app.startOutboxWorker(scope)
 
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     log.info("orders: слушаю порт {}", port)
@@ -476,6 +665,8 @@ fun main() {
             get("/healthz") { call.respondJson(HttpStatusCode.OK, buildJsonObject { put("status", "ok") }) }
             post("/orders") { app.createOrder(call) }
             get("/orders/{id}") { app.getOrder(call) }
+            post("/webhooks/delivery") { app.deliveryWebhook(call) }
+            get("/users/{id}/bonus") { app.getBonus(call) }
         }
     }.start(wait = true)
 }
